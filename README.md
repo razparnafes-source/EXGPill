@@ -25,14 +25,11 @@ Meant to work with EXGPill connected through arduino to a com port.
 - scipy
 - matplotlib
 
-(You can create a virtual environment before installing if desired.)
-
 **Usage**
 - From command line:
 python Serial_Read_Signal_Toolkit.py --port COM5 --baud 115200 --timeout 1.0 --reconnect-delay 2.0
 
 - Or run without args to use defaults:
-
 python Serial_Read_Signal_Toolkit.py
 
 - CLI options:
