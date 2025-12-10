@@ -1,6 +1,6 @@
-# Signal Processing Toolkit — EOG (Serial_Read_Signal_Toolkit.py)
+# Signal Processing Toolkit (Serial_Read_Signal_Toolkit.py)
 
-A Simple Tkinter GUI for reading numeric signals from a serial port (e.g. EOG), visualizing time-domain and FFT plots, applying simple processing (detrend, filters, normalization), and exporting session data to CSV.
+A Simple Tkinter GUI for reading numeric signals from a serial port (e.g. EOG, EMC, ECG, EEG), visualizing time-domain and FFT plots, applying simple processing (detrend, filters, normalization), and exporting session data to CSV.
 Meant to work with EXGPill connected through arduino to a com port.
 
 **File:** `Serial_Read_Signal_Toolkit.py`
