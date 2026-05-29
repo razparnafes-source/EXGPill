@@ -14,6 +14,7 @@ from matplotlib.figure import Figure
 import numpy as np
 from scipy import signal
 import csv
+import biosignal_tools as bt
 
 # Signal Processing Toolkit for EOG
 # Requirements: pyserial, matplotlib, numpy, scipy
@@ -79,6 +80,18 @@ class SerialGUIApp:
         # Normalization
         self.normalize = tk.BooleanVar(value=False)
         self.detrend = tk.BooleanVar(value=False)
+
+        # Measurement and annotation state
+        self.measure_mode = tk.BooleanVar(value=False)
+        self._measure_cid = None
+        self.measure_points = []
+        self.measure_artists = []
+
+        # Playback state
+        self.paused = False
+        self.view_offset = 0  # samples offset from live end
+        self._paused_snapshot = None
+        self._paused_snapshot_end = None
         
         self._create_widgets()
         
@@ -98,29 +111,33 @@ class SerialGUIApp:
         right_frame = ttk.Frame(main_paned)
         main_paned.add(right_frame, weight=1)
         
-        # Create scrollable control panel
-        canvas = tk.Canvas(left_frame, bg="white")
-        scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Build control sections in scrollable frame
-        self._build_serial_controls(scrollable_frame)
-        self._build_view_controls(scrollable_frame)
-        self._build_performance_controls(scrollable_frame)
-        self._build_filter_controls(scrollable_frame)
-        self._build_analysis_controls(scrollable_frame)
-        self._build_export_controls(scrollable_frame)
+        # Create tabbed control panel
+        notebook = ttk.Notebook(left_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        main_tab = ttk.Frame(notebook)
+        filter_tab = ttk.Frame(notebook)
+        measure_tab = ttk.Frame(notebook)
+        analysis_tab = ttk.Frame(notebook)
+        export_tab = ttk.Frame(notebook)
+        help_tab = ttk.Frame(notebook)
+
+        notebook.add(main_tab, text="Main")
+        notebook.add(filter_tab, text="Filter")
+        notebook.add(measure_tab, text="Measure")
+        notebook.add(analysis_tab, text="Analysis")
+        notebook.add(export_tab, text="Export")
+        notebook.add(help_tab, text="Help")
+
+        # Build control sections on tabs
+        self._build_serial_controls(main_tab)
+        self._build_view_controls(main_tab)
+        self._build_performance_controls(main_tab)
+        self._build_filter_controls(filter_tab)
+        self._build_measure_controls(measure_tab)
+        self._build_analysis_controls(analysis_tab)
+        self._build_export_controls(export_tab)
+        self._build_help_controls(help_tab)
         
         # (graph frame will be created inside graph_container below)
         
@@ -129,16 +146,6 @@ class SerialGUIApp:
         self.fig = None
         self.axes = {}
         
-        # Status (kept on left panel)
-        status_frame = ttk.LabelFrame(left_frame, text="Status", height=100)
-        status_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        self.status_label = ttk.Label(status_frame, text="Status: Stopped", foreground="red")
-        self.status_label.pack(pady=5)
-
-        self.value_label = ttk.Label(status_frame, text="Last value: N/A")
-        self.value_label.pack(pady=2)
-
         # Graph container on right: graphs on top, log below
         self.graph_container = ttk.Frame(right_frame)
         self.graph_container.pack(fill=tk.BOTH, expand=True)
@@ -286,23 +293,53 @@ class SerialGUIApp:
         
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        
+        # Signal type selector for context-aware statistics
+        ttk.Label(btn_frame, text="Signal Type:").pack(anchor=tk.W)
+        self.signal_type = tk.StringVar(value="Generic")
+        sig_combo = ttk.Combobox(btn_frame, textvariable=self.signal_type,
+                     values=["Generic", "ECG", "EEG", "EMG", "EOG"], state="readonly")
+        sig_combo.pack(fill=tk.X, pady=(0,4))
+
         ttk.Button(btn_frame, text="Statistics", command=self._show_statistics).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="Clear Data", command=self._clear_data).pack(fill=tk.X, pady=2)
-        
-    def _build_export_controls(self, parent):
-        """Data export controls"""
-        frame = ttk.LabelFrame(parent, text="Export")
+
+    def _build_measure_controls(self, parent):
+        """Playback and measurement controls"""
+        frame = ttk.LabelFrame(parent, text="Measure")
         frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Export button starts disabled; enabled only after a listening session stops
-        self.export_btn = ttk.Button(btn_frame, text="Export CSV", command=self._export_csv, state=tk.DISABLED)
-        self.export_btn.pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="Load CSV", command=self._load_csv).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="Save Figure", command=self._save_figure).pack(fill=tk.X, pady=2)
+
+        playback_frame = ttk.LabelFrame(frame, text="Playback")
+        playback_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.paused = False
+        self.view_offset = 0  # samples offset from live end
+        self._paused_snapshot = None
+        self.display_seconds_var = tk.DoubleVar(value=5.0)
+        self.step_seconds_var = tk.DoubleVar(value=1.0)
+
+        button_block = ttk.Frame(playback_frame)
+        button_block.pack(fill=tk.X, padx=5, pady=4)
+        self.pause_btn = ttk.Button(button_block, text="Pause", command=self._toggle_pause)
+        self.pause_btn.pack(fill=tk.X, pady=2)
+        ttk.Button(button_block, text="<<", command=self._step_back).pack(fill=tk.X, pady=2)
+        ttk.Button(button_block, text=">>", command=self._step_forward).pack(fill=tk.X, pady=2)
+        ttk.Button(button_block, text="Live", command=self._goto_live).pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(playback_frame, text="Measure Mode", variable=self.measure_mode, command=self._toggle_measure).pack(fill=tk.X, padx=5, pady=4)
+
+        window_frame = ttk.Frame(playback_frame)
+        window_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(window_frame, text="Window (s):").pack(anchor=tk.W)
+        ttk.Entry(window_frame, textvariable=self.display_seconds_var, width=10).pack(fill=tk.X, pady=2)
+
+        step_frame = ttk.Frame(playback_frame)
+        step_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(step_frame, text="Step (s):").pack(anchor=tk.W)
+        ttk.Entry(step_frame, textvariable=self.step_seconds_var, width=10).pack(fill=tk.X, pady=2)
+
+        meas_row = ttk.LabelFrame(frame, text="Measurement")
+        meas_row.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(meas_row, text="Clear Markers", command=self._clear_measurements).pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(meas_row, text="Enable Measure Mode to click the plot and compare two points.", wraplength=280, foreground="gray").pack(fill=tk.X, padx=5, pady=(4,2))
         
     def _build_performance_controls(self, parent):
         """Performance tuning controls: redraw rate and buffer size (sliders)"""
@@ -330,6 +367,66 @@ class SerialGUIApp:
         # Small note
         ttk.Label(frame, text="Adjust to trade performance vs. resolution", foreground="gray").pack(anchor=tk.W, padx=5, pady=(6,4))
         
+    def _build_export_controls(self, parent):
+        """Export controls for session CSV and figure saving"""
+        frame = ttk.LabelFrame(parent, text="Export")
+        frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.export_btn = ttk.Button(frame, text="Export Session CSV", command=self._export_csv, state=tk.DISABLED)
+        self.export_btn.pack(fill=tk.X, padx=5, pady=2)
+
+        ttk.Button(frame, text="Save Figure", command=self._save_figure).pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(frame, text="Load CSV", command=self._load_csv).pack(fill=tk.X, padx=5, pady=2)
+
+        ttk.Label(frame, text="Export recorded session data after Stop or load CSV for review.", wraplength=280, foreground="gray").pack(fill=tk.X, padx=5, pady=(6,4))
+
+    def _build_help_controls(self, parent):
+        """Help tab with usage instructions and physical meaning explanations."""
+        frame = ttk.LabelFrame(parent, text="Usage Guide")
+        frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        help_text = tk.Text(frame, wrap=tk.WORD, height=20)
+        help_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        help_text.insert(tk.END, (
+            "Signal Processing Toolkit Help\n"
+            "==============================\n\n"
+            "Main tab:\n"
+            "  - Port: Serial port for your sensor or amplifier. On Windows this is usually COMx.\n"
+            "  - Baud: Communication speed for the sensor link. Must match the device.\n"
+            "  - Fs (Hz): Sample rate used to convert samples to time.\n\n"
+            "Visualization:\n"
+            "  - Time Domain: Plots the waveform amplitude over time. Useful for seeing raw EOG/EEG/EMG morphology.\n"
+            "  - FFT: Shows the frequency content of the signal. Use it to identify dominant rhythms and noise.\n"
+            "  - Window: Windowing function applied before FFT to reduce spectral leakage.\n\n"
+            "Filter tab:\n"
+            "  - Lowpass: Removes high-frequency noise above the selected cutoff. Good for EOG/ECG smoothing.\n"
+            "  - Highpass: Removes slow drift and baseline wander below the cutoff. Useful for ECG and EOG.\n"
+            "  - Bandpass: Keeps only the band between low and high cutoffs. Good for isolating EMG or alpha/beta EEG bands.\n"
+            "  - Notch: Attenuates a narrow frequency, typically 50/60 Hz power line noise.\n\n"
+            "Measure tab:\n"
+            "  - Pause: Freeze the live plot to inspect the waveform carefully.\n"
+            "  - << / >>: Step backward or forward in the buffered signal while paused.\n"
+            "  - Live: Return to the most recent data instantly.\n"
+            "  - Measure Mode: Click on the plot to mark two points and compute time and amplitude differences.\n\n"
+            "Analysis tab:\n"
+            "  - Signal Type: Choose the physiological signal type to enable context-specific metrics.\n"
+            "  - Statistics: Computes time-domain and frequency-domain metrics for the current data.\n"
+            "    * ECG: QRS count, heart rate, HRV (SDNN/RMSSD).\n"
+            "    * EEG: Delta/theta/alpha/beta band power estimates.\n"
+            "    * EMG: RMS and median frequency as measures of muscle activation.\n"
+            "    * EOG: Blink-like peak count and estimated blink rate.\n\n"
+            "Export tab:\n"
+            "  - Export Session CSV: Save the data collected between Start and Stop as a CSV file.\n"
+            "  - Save Figure: Save the current plot view to a PNG or PDF.\n"
+            "  - Load CSV: Load saved data for analysis or replay.\n\n"
+            "Tips:\n"
+            "  1. Always match the sample rate and serial baud rate to your device.\n"
+            "  2. Use filtering first, then view and analyze the signal.\n"
+            "  3. Pause and step through the data if the live plot is moving too fast.\n"
+            "  4. Save figures and CSV data after stopping a recording session.\n"
+        ))
+        help_text.config(state=tk.DISABLED)
+
     def _start_listening(self):
         self.port = self.port_var.get()
         self.baud = int(self.baud_var.get())
@@ -340,7 +437,6 @@ class SerialGUIApp:
         self.listening = True
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="Status: Listening", foreground="green")
         # clear session data for a fresh recording session and disable export
         try:
             self.session_data.clear()
@@ -360,7 +456,6 @@ class SerialGUIApp:
         self.listening = False
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Status: Stopped", foreground="red")
         self._log("Listening stopped")
         # stop redraw loop
         self._stop_redraw_loop()
@@ -417,8 +512,7 @@ class SerialGUIApp:
                 time.sleep(self.reconnect_delay)
     
     def _update_graph_and_label(self, value, line):
-        """Update graph and value label"""
-        self.value_label.config(text=f"Last value: {value:.4f} (Buf: {len(self.data_buffer)})")
+        """Update graph when new data arrives."""
         self._log(f"Data: {line}")
         # do not draw on every sample; redraw loop will update at throttled rate
     
@@ -471,6 +565,11 @@ class SerialGUIApp:
     def _update_layout(self):
         """Update figure layout based on selected views"""
         if self.canvas:
+            try:
+                if self._measure_cid is not None:
+                    self.canvas.mpl_disconnect(self._measure_cid)
+            except Exception:
+                pass
             self.canvas.get_tk_widget().destroy()
             if self.fig:
                 self.fig.clear()
@@ -524,6 +623,12 @@ class SerialGUIApp:
         
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        if self.measure_mode.get():
+            try:
+                self._measure_cid = self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+            except Exception as e:
+                self._log(f"Measure reconnect error: {e}")
         
         self._draw_graph()
     
@@ -644,25 +749,50 @@ class SerialGUIApp:
 
         data, fs = result
 
+        # Determine display window in samples and slice according to view_offset
+        try:
+            display_seconds = float(self.display_seconds_var.get())
+        except Exception:
+            display_seconds = 5.0
+        n_show = max(1, int(display_seconds * fs))
+        total = len(data)
+        self.view_offset = max(0, min(len(data), int(self.view_offset)))
+
+        if self.paused and self._paused_snapshot is not None:
+            data_for_draw = self._paused_snapshot
+        else:
+            data_for_draw = data
+
+        total_draw = len(data_for_draw)
+        end_idx = max(0, min(total_draw, total_draw - int(self.view_offset)))
+        start_idx = max(0, end_idx - n_show)
+        slice_data = data_for_draw[start_idx:end_idx]
+        # expose for measurement handlers
+        self._last_slice = slice_data
+        self._last_slice_start = start_idx
+
         # Time domain incremental update
         if 'time' in self.axes and 'time' in self.lines:
             ax = self.axes['time']
             line = self.lines['time']
-            time_axis = np.arange(len(data)) / fs
-            line.set_data(time_axis, data)
+            if len(slice_data) > 0:
+                time_axis = (start_idx + np.arange(len(slice_data))) / fs
+            else:
+                time_axis = np.array([])
+            line.set_data(time_axis, slice_data)
             ax.relim()
             ax.autoscale_view()
-            ax.set_title(f"Time Domain (Fs = {fs} Hz, N = {len(data)})")
+            ax.set_title(f"Time Domain (Fs = {fs} Hz, Showing {len(slice_data)} of {len(data)} samples)")
 
         # FFT incremental update (compute only if FFT view is visible)
         if 'fft' in self.axes and 'fft' in self.lines:
             ax = self.axes['fft']
             line = self.lines['fft']
-            if len(data) > 0:
-                window = signal.get_window(self.window_func.get(), len(data))
-                windowed_data = data * window
+            if len(slice_data) > 0:
+                window = signal.get_window(self.window_func.get(), len(slice_data))
+                windowed_data = slice_data * window
                 fft = np.abs(np.fft.fft(windowed_data))
-                frequencies = np.fft.fftfreq(len(data), 1 / fs)
+                frequencies = np.fft.fftfreq(len(slice_data), 1 / fs)
                 positive_freq_idx = len(frequencies) // 2
                 freqs = frequencies[:positive_freq_idx]
                 mags = fft[:positive_freq_idx]
@@ -677,6 +807,11 @@ class SerialGUIApp:
         except Exception:
             # fallback to draw if idle isn't available
             self.canvas.draw()
+        # If not paused and at live, ensure the view follows the live stream
+        if not self.paused:
+            self.view_offset = 0
+            self._paused_snapshot = None
+            self._paused_snapshot_end = None
     
     def _show_statistics(self):
         """Show signal statistics"""
@@ -696,26 +831,84 @@ class SerialGUIApp:
             fs = self.sampling_frequency
 
         data = self._apply_processing(raw, fs)
-        
-        # Calculate statistics
+        # Calculate base statistics
         mean = np.mean(data)
         std = np.std(data)
         min_val = np.min(data)
         max_val = np.max(data)
-        rms = np.sqrt(np.mean(data**2))
+        rms_val = np.sqrt(np.mean(data**2))
         peak_to_peak = max_val - min_val
-        
-        # Frequency analysis
-        if len(data) > 0:
-            fft = np.abs(np.fft.fft(data))
-            frequencies = np.fft.fftfreq(len(data), 1/fs)
-            dominant_idx = np.argmax(fft[:len(fft)//2])
-            dominant_freq = frequencies[dominant_idx]
-        else:
-            dominant_freq = 0.0
-        
+
+        # Frequency analysis (PSD-based)
+        f_psd, pxx = bt.compute_psd(data, fs)
+        dominant_freq = 0.0
+        if len(pxx) > 0:
+            dominant_freq = f_psd[np.argmax(pxx)]
+
+        # Context-aware extra stats
+        sig_type = getattr(self, 'signal_type', tk.StringVar(value='Generic')).get()
+        extras = []
+
+        if sig_type == 'ECG':
+            # QRS, RR intervals, HR, HRV
+            try:
+                qrs = bt.detect_qrs_simple(data, fs)
+                rr = bt.compute_rr_intervals(qrs, fs)
+                mean_hr = bt.compute_mean_hr(rr) if len(rr) > 0 else 0.0
+                sdnn = float(np.std(rr)) if len(rr) > 0 else 0.0
+                rmssd = float(np.sqrt(np.mean(np.diff(rr)**2))) if len(rr) > 1 else 0.0
+                extras.append(f"QRS Count: {len(qrs)}")
+                extras.append(f"Mean HR: {mean_hr:.2f} bpm")
+                extras.append(f"SDNN: {sdnn:.3f} s")
+                extras.append(f"RMSSD: {rmssd:.3f} s")
+            except Exception as e:
+                extras.append(f"ECG metrics error: {e}")
+
+        elif sig_type == 'EEG':
+            # Band powers
+            try:
+                bands = {'Delta': (0.5,4), 'Theta': (4,8), 'Alpha': (8,13), 'Beta': (13,30)}
+                band_powers = {}
+                total_power = np.trapz(pxx, f_psd) if len(pxx)>0 else 1.0
+                for name, (lo, hi) in bands.items():
+                    idx = np.logical_and(f_psd >= lo, f_psd <= hi)
+                    band_powers[name] = float(np.trapz(pxx[idx], f_psd[idx])) if np.any(idx) else 0.0
+                    extras.append(f"{name} Power: {band_powers[name]:.6f}")
+                extras.append(f"Total Power: {total_power:.6f}")
+            except Exception as e:
+                extras.append(f"EEG metrics error: {e}")
+
+        elif sig_type == 'EMG':
+            try:
+                rms_emg = bt.rms(data)
+                # median frequency from PSD
+                if len(pxx) > 0:
+                    cumsum = np.cumsum(pxx)
+                    half = cumsum[-1] / 2.0
+                    idx = np.searchsorted(cumsum, half)
+                    median_freq = float(f_psd[idx]) if idx < len(f_psd) else 0.0
+                else:
+                    median_freq = 0.0
+                extras.append(f"RMS: {rms_emg:.6f}")
+                extras.append(f"Median Frequency: {median_freq:.2f} Hz")
+            except Exception as e:
+                extras.append(f"EMG metrics error: {e}")
+
+        elif sig_type == 'EOG':
+            try:
+                # Blink rate via envelope peaks
+                env = bt.envelope(data)
+                blinks = bt.detect_peaks_generic(env, fs, height=None, distance_seconds=0.2)
+                extras.append(f"Blink Count (est): {len(blinks)}")
+                if len(blinks) > 1:
+                    rr = bt.compute_rr_intervals(blinks, fs)
+                    extras.append(f"Blink Rate: {60.0/np.mean(rr):.2f} BPM")
+            except Exception as e:
+                extras.append(f"EOG metrics error: {e}")
+
+        # Build stats text
         stats_text = f"""
-Signal Statistics:
+Signal Statistics ({sig_type}):
 ━━━━━━━━━━━━━━━━━━━━━━━━
 Samples: {len(data)}
 Duration: {len(data)/fs:.3f} s
@@ -727,11 +920,16 @@ Time Domain:
   Min: {min_val:.6f}
   Max: {max_val:.6f}
   Peak-to-Peak: {peak_to_peak:.6f}
-  RMS: {rms:.6f}
+  RMS: {rms_val:.6f}
 
 Frequency Domain:
   Dominant Freq: {dominant_freq:.2f} Hz
 """
+
+        if extras:
+            stats_text += "\nAdditional Metrics:\n"
+            for ex in extras:
+                stats_text += f"  {ex}\n"
         
         # Create popup window
         stats_window = tk.Toplevel(self.root)
@@ -744,6 +942,170 @@ Frequency Domain:
         text_widget.config(state=tk.DISABLED)
         
         self._log("Statistics calculated and displayed")
+
+    # --- Playback and measurement handlers ---
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        if hasattr(self, 'pause_btn'):
+            self.pause_btn.config(text='Resume' if self.paused else 'Pause')
+        if self.paused:
+            processed = self._get_processed_data()
+            if processed is not None:
+                self._paused_snapshot, _ = processed
+                self._paused_snapshot_end = len(self._paused_snapshot)
+            else:
+                self._paused_snapshot = np.array([])
+                self._paused_snapshot_end = 0
+            self.view_offset = 0
+        else:
+            self.view_offset = 0
+            self._paused_snapshot = None
+            self._paused_snapshot_end = None
+        self._draw_graph()
+        self._log(f"Paused: {self.paused}")
+
+    def _step_back(self):
+        try:
+            step = float(self.step_seconds_var.get())
+        except Exception:
+            step = 1.0
+        try:
+            fs = float(self.fs_var.get())
+        except Exception:
+            fs = self.sampling_frequency
+        if not self.paused or self._paused_snapshot is None:
+            processed = self._get_processed_data()
+            if processed is not None:
+                self._paused_snapshot, _ = processed
+                self._paused_snapshot_end = len(self._paused_snapshot)
+            else:
+                self._paused_snapshot = np.array([])
+                self._paused_snapshot_end = 0
+            self.paused = True
+            if hasattr(self, 'pause_btn'):
+                self.pause_btn.config(text='Resume')
+        self.view_offset = min(len(self._paused_snapshot), int(self.view_offset + step * fs))
+        self._draw_graph()
+
+    def _step_forward(self):
+        try:
+            step = float(self.step_seconds_var.get())
+        except Exception:
+            step = 1.0
+        try:
+            fs = float(self.fs_var.get())
+        except Exception:
+            fs = self.sampling_frequency
+        if not self.paused or self._paused_snapshot is None:
+            processed = self._get_processed_data()
+            if processed is not None:
+                self._paused_snapshot, _ = processed
+                self._paused_snapshot_end = len(self._paused_snapshot)
+            else:
+                self._paused_snapshot = np.array([])
+                self._paused_snapshot_end = 0
+            self.paused = True
+            if hasattr(self, 'pause_btn'):
+                self.pause_btn.config(text='Resume')
+        self.view_offset = max(0, int(self.view_offset - step * fs))
+        if self.view_offset == 0:
+            if hasattr(self, 'pause_btn'):
+                self.pause_btn.config(text='Pause')
+        self._draw_graph()
+
+    def _goto_live(self):
+        self.view_offset = 0
+        self.paused = False
+        self._paused_snapshot = None
+        if hasattr(self, 'pause_btn'):
+            self.pause_btn.config(text='Pause')
+        self._draw_graph()
+
+    def _toggle_measure(self):
+        if self.measure_mode.get():
+            try:
+                self._measure_cid = self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+                self._log('Measure mode enabled')
+            except Exception as e:
+                self._log(f'Measure enable error: {e}')
+        else:
+            try:
+                if hasattr(self, '_measure_cid'):
+                    self.canvas.mpl_disconnect(self._measure_cid)
+                self._clear_measurements()
+                self._log('Measure mode disabled')
+            except Exception as e:
+                self._log(f'Measure disable error: {e}')
+
+    def _on_canvas_click(self, event):
+        # ignore clicks outside axes
+        if event.inaxes is None:
+            return
+        if not hasattr(self, '_last_slice') or self._last_slice is None:
+            return
+        # compute sample index from x (seconds)
+        try:
+            fs = float(self.fs_var.get())
+        except Exception:
+            fs = self.sampling_frequency
+        x_sec = event.xdata
+        if x_sec is None:
+            return
+        sample_idx = int(self._last_slice_start + round(x_sec * fs))
+        sample_idx = max(0, min(sample_idx, self._last_slice_start + len(self._last_slice) - 1))
+        val = float(self._last_slice[sample_idx - self._last_slice_start])
+
+        pts = getattr(self, 'measure_points', [])
+        pts.append((sample_idx, val, x_sec))
+        self.measure_points = pts
+
+        ax = event.inaxes
+        # draw marker
+        marker = ax.plot(x_sec, val, marker='o', color='red')
+        if not hasattr(self, 'measure_artists'):
+            self.measure_artists = []
+        self.measure_artists.extend(marker)
+
+        if len(self.measure_points) == 2:
+            (i1, v1, x1), (i2, v2, x2) = self.measure_points
+            dt = abs(i2 - i1) / fs
+            dv = v2 - v1
+            # draw vertical lines
+            l1 = ax.axvline(x=x1, color='red', linestyle='--')
+            l2 = ax.axvline(x=x2, color='red', linestyle='--')
+            self.measure_artists.extend([l1, l2])
+            # annotate
+            ann = ax.annotate(f"Δt={dt:.3f}s\nΔv={dv:.4f}", xy=((x1+x2)/2, (v1+v2)/2),
+                              bbox=dict(boxstyle='round', fc='yellow', alpha=0.6))
+            self.measure_artists.append(ann)
+            self._log(f"Measurement: Δt={dt:.3f}s, Δv={dv:.4f}")
+            # keep only two points
+            self.measure_points = []
+
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            self.canvas.draw()
+
+    def _clear_measurements(self):
+        if hasattr(self, 'measure_artists'):
+            try:
+                for a in self.measure_artists:
+                    try:
+                        a.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self.measure_artists = []
+        self.measure_points = []
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            try:
+                self.canvas.draw()
+            except Exception:
+                pass
 
     # --- Redraw scheduling to reduce CPU usage ---
     def _start_redraw_loop(self):
